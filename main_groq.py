@@ -20,6 +20,8 @@ from unstructured.partition.docx import partition_docx
 from unstructured.partition.pptx import partition_pptx
 from unstructured.partition.text import partition_text
 from fastapi.middleware.cors import CORSMiddleware
+from botocore.exceptions import ClientError
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -31,7 +33,6 @@ AWS_ACCESS_KEY = os.getenv("access_key")
 AWS_SECRET_KEY = os.getenv("secret_key")
 AWS_REGION = os.getenv("region")
 
-# Validate required environment variables
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY environment variable is required")
 if not S3_BUCKET:
@@ -50,26 +51,23 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # For dev, allow all. For prod, specify your frontend URL.
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 profanity.load_censor_words()
 
-# Embedding model
 bert_model = BertModel.from_pretrained("bert-base-uncased")
 bert_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
-# Global variables
-docs = []
-doc_keys = []
-doc_ids = []
+# Globals
+docs, doc_keys, doc_ids = [], [], []
 faiss_index = None
 
 def encode_documents(texts: list[str]) -> np.ndarray:
     if not texts:
-        return np.array([]).reshape(0, 768)  # Return empty array with correct shape
+        return np.array([]).reshape(0, 768)
     inputs = bert_tokenizer(texts, return_tensors='pt', padding=True, truncation=True)
     with torch.no_grad():
         outputs = bert_model(**inputs)
@@ -77,24 +75,12 @@ def encode_documents(texts: list[str]) -> np.ndarray:
     return embeddings.cpu().numpy()
 
 def set_up_faiss_index(documents: list[str], encode_fn: Callable) -> faiss.Index:
-    if not documents:
-        # Create an empty index with correct dimension
-        index = faiss.IndexFlatL2(768)  # BERT base dimension
-        return index
-    
-    embeddings = encode_fn(documents).astype(np.float32)
-    if embeddings.size == 0:
-        # Create an empty index with correct dimension
-        index = faiss.IndexFlatL2(768)  # BERT base dimension
-        return index
-    
-    embeddings = np.atleast_2d(embeddings)
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    
-    if embeddings.shape[0] > 0:
-        index.add(embeddings)
-    
+    index = faiss.IndexFlatL2(768)
+    if documents:
+        embeddings = encode_fn(documents).astype(np.float32)
+        if embeddings.size > 0:
+            embeddings = np.atleast_2d(embeddings)
+            index.add(embeddings)
     return index
 
 def load_documents_from_s3(prefix: str) -> list[tuple[str, str, str]]:
@@ -106,7 +92,7 @@ def load_documents_from_s3(prefix: str) -> list[tuple[str, str, str]]:
             if key.endswith(".txt"):
                 file_obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
                 content = file_obj['Body'].read().decode("utf-8")
-                doc_id = Path(key).parts[-3]  # folder name (original doc name)
+                doc_id = Path(key).parts[-3]
                 documents.append((doc_id, key, content))
     except Exception as e:
         print(f"S3 Load Error: {e}")
@@ -120,31 +106,26 @@ def reload_index_s3(prefix: str):
     doc_ids = [doc_id for doc_id, _, _ in doc_triples]
     faiss_index = set_up_faiss_index(docs, encode_documents)
 
-def retrieve_similar_documents(
-    query: str,
-    index: faiss.Index,
-    documents: list[str],
-    encode_fn: Callable,
-    k: int,
-    threshold: float = 90.0
-) -> list[dict]:
+def ensure_index_built(prefix: str) -> bool:
+    global faiss_index
+    if faiss_index is not None and faiss_index.ntotal > 0:
+        return True
+    try:
+        reload_index_s3(prefix)
+        return faiss_index is not None and faiss_index.ntotal > 0
+    except Exception as e:
+        print(f"[ensure_index_built] Failed to build FAISS index: {e}")
+        return False
+
+def retrieve_similar_documents(query: str, index: faiss.Index, documents: list[str], encode_fn: Callable, k: int, threshold: float = 90.0) -> list[dict]:
     if index is None or not documents or index.ntotal == 0:
         return []
-    
     try:
         emb = encode_fn([query]).astype(np.float32)
-        if emb.size == 0:
-            return []
-        
         emb = np.atleast_2d(emb)
         k = min(max(1, k), len(documents), index.ntotal)
-        
-        if k < 1:
-            return []
-        
         distances, indices = index.search(emb, k)
         results = []
-        
         for dist, idx in zip(distances[0], indices[0]):
             if 0 <= idx < len(documents) and dist <= threshold:
                 results.append({
@@ -164,7 +145,6 @@ def format_prompt(query: str, context: str) -> str:
 def generate_answer(query: str, docs_with_scores: list[tuple[str, float]]) -> str:
     if not docs_with_scores:
         return "No relevant documents found to answer the question."
-    
     context = "\n".join(doc for doc, _ in docs_with_scores)
     prompt = format_prompt(query, context)
     try:
@@ -178,15 +158,29 @@ def generate_answer(query: str, docs_with_scores: list[tuple[str, float]]) -> st
             max_tokens=300,
             top_p=1
         )
-        if response.choices and response.choices[0].message and response.choices[0].message.content:
-            return response.choices[0].message.content.strip()
-        else:
-            return "No answer generated."
+        return response.choices[0].message.content.strip() if response.choices else "No answer generated."
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
 class Query(BaseModel):
     query: str
+    org: str
+    dept: str
+
+@app.post("/")
+def auto_build_index(profile: dict):
+    org = profile.get("organization")
+    dept = profile.get("department")
+    base_output_dir = "document-upload2/test-output"
+    prefix = f"{base_output_dir}/{org}/{dept}"
+    if not org or not dept:
+        raise HTTPException(status_code=400, detail="Missing organization or department")
+    built = ensure_index_built(prefix)
+    return {
+        "message": "Index is ready" if built else "Failed to build index",
+        "index_built": built,
+        "documents_loaded": len(docs)
+    }
 
 class UploadRequest(BaseModel):
     file_path: str
@@ -300,18 +294,59 @@ def process_file(data: UploadRequest) -> List[str]:
                 if data.debug_mode:
                     print(f"[Text Upload Error] {text_err}")
 
+    # Rebuild the FAISS index after successful upload
+    try:
+        org_dept_prefix = f"{data.base_output_dir}/{data.org}/{data.dept}"
+        reload_index_s3(org_dept_prefix)
+        if data.debug_mode:
+            print(f"[Info] Rebuilt FAISS index for prefix: {org_dept_prefix}")
+    except Exception as e:
+        if data.debug_mode:
+            print(f"[Warning] Failed to rebuild index: {e}")
+
     return text_chunks
+
+@app.get("/index_status")
+def get_index_status(org: str, dept: str, base_output_dir: str = "document-upload2/test-output"):
+    prefix = f"{base_output_dir}/{org}/{dept}"
+    ensure_index_built(prefix)
+    return {
+        "index_built": faiss_index is not None,
+        "total_documents": len(docs),
+        "index_size": faiss_index.ntotal if faiss_index else 0,
+        "document_ids": doc_ids
+    }
 
 @app.post("/Answer")
 def answer_question(data: Query):
-    if faiss_index is None:
-        return {"result": "No Relevant Document Found (index not built)"}
-    retrieved = retrieve_similar_documents(data.query, faiss_index, docs, encode_documents, k=5)
-    if not retrieved:
-        return {"result": "No Relevant Document Found"}
+    global faiss_index
 
+    prefix = f"document-upload2/test-output/{data.org}/{data.dept}"
+
+    # Rebuild index if it's not already built or is empty
+    if faiss_index is None or faiss_index.ntotal == 0:
+        try:
+            reload_index_s3(prefix)
+            if faiss_index is None or faiss_index.ntotal == 0:
+                return {"result": "No Relevant Document Found (index build failed)", "source_documents": []}
+        except Exception as e:
+            return {"result": f"Error rebuilding index: {str(e)}", "source_documents": []}
+
+    # Retrieve relevant documents
+    retrieved = retrieve_similar_documents(
+        data.query,
+        faiss_index,
+        docs,
+        encode_documents,
+        k=5
+    )
+
+    if not retrieved:
+        return {"result": "No Relevant Document Found", "source_documents": []}
+
+    # Generate answer from retrieved docs
     answer = generate_answer(data.query, [(r["content"], r["score"]) for r in retrieved])
-    full_docs = list({r["doc_id"] for r in retrieved})  # Unique original doc names
+    full_docs = list({r["doc_id"] for r in retrieved})  # Unique document IDs
 
     return {
         "result": answer,
@@ -319,12 +354,13 @@ def answer_question(data: Query):
     }
 
 @app.get("/get_source_document/{doc_id}")
-def get_source_document(doc_id: str, org: str, dept: str, base_output_dir: str = "test-output"):
+def get_source_document(doc_id: str, org: str, dept: str, base_output_dir: str = "document-upload2/test-output"):
     prefix = f"{base_output_dir}/{org}/{dept}/{doc_id}/"
+
     try:
         response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
         if "Contents" not in response:
-            raise HTTPException(status_code=404, detail="Document not found in S3")
+            raise HTTPException(status_code=404, detail=f"No document found in S3 at prefix: {prefix}")
 
         text_files = []
         image_files = []
@@ -333,21 +369,33 @@ def get_source_document(doc_id: str, org: str, dept: str, base_output_dir: str =
             key = obj["Key"]
 
             if key.endswith(".txt"):
-                file_obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-                content = file_obj['Body'].read().decode("utf-8")
-                text_files.append({
-                    "key": key,
-                    "content": content
-                })
+                try:
+                    file_obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+                    content = file_obj['Body'].read().decode("utf-8")
+                    text_files.append({
+                        "key": key,
+                        "content": content
+                    })
+                except Exception as e:
+                    text_files.append({
+                        "key": key,
+                        "error": f"Failed to read text: {str(e)}"
+                    })
 
             elif key.lower().endswith((".png", ".jpg", ".jpeg")):
-                file_obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
-                image_data = file_obj['Body'].read()
-                image_base64 = base64.b64encode(image_data).decode("utf-8")
-                image_files.append({
-                    "key": key,
-                    "base64": image_base64
-                })
+                try:
+                    file_obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+                    image_data = file_obj['Body'].read()
+                    image_base64 = base64.b64encode(image_data).decode("utf-8")
+                    image_files.append({
+                        "key": key,
+                        "base64": image_base64
+                    })
+                except Exception as e:
+                    image_files.append({
+                        "key": key,
+                        "error": f"Failed to load image: {str(e)}"
+                    })
 
         return {
             "doc_id": doc_id,
@@ -356,33 +404,95 @@ def get_source_document(doc_id: str, org: str, dept: str, base_output_dir: str =
             "images": image_files
         }
 
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"S3 access failed: {e.response['Error']['Message']}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"S3 access failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
-#test block for local running
-if __name__ == "__main__":
-    test_request = UploadRequest(
-        file_path="C://Users//Riya//OneDrive//Desktop//Indian_Foods.docx",
-        base_output_dir="test-output",
-        org="demo-org",
-        dept="demo-dept",
-        debug_mode=True
-    )
-
-    uploaded_keys = process_file(test_request)
-    print("Uploaded keys:", uploaded_keys)
-
-    s3_prefix = f"{test_request.base_output_dir}/{test_request.org}/{test_request.dept}"
-    reload_index_s3(s3_prefix)
-
-    query = "What does Staple ingredients in Indian cooking include ?"
-    if profanity.contains_profanity(query):
-        print("Profanity in query.")
-    else:
-        retrieved = retrieve_similar_documents(query, faiss_index, docs, encode_documents, k=5)
-        if not retrieved:
-            print("No Relevant Document Found.")
+@app.delete("/delete_document")
+def delete_document(org: str, dept: str, doc_id: str, base_output_dir: str = "document-upload2/test-output"):
+    """Delete a document and all its associated files from S3"""
+    try:
+        prefix = f"{base_output_dir}/{org}/{dept}/{doc_id}/"
+        
+        # List all objects with this prefix
+        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix)
+        
+        if 'Contents' not in response:
+            raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+        
+        # Delete all objects with this prefix
+        objects_to_delete = [{'Key': obj['Key']} for obj in response['Contents']]
+        
+        if objects_to_delete:
+            s3.delete_objects(
+                Bucket=S3_BUCKET,
+                Delete={'Objects': objects_to_delete}
+            )
+            print(f"[Delete] Deleted {len(objects_to_delete)} objects for document {doc_id}")
+        
+        # Rebuild the index after deletion
+        org_dept_prefix = f"{base_output_dir}/{org}/{dept}"
+        reload_index_s3(org_dept_prefix)
+        
+        return {
+            "status": "success",
+            "message": f"Document {doc_id} and all associated files deleted successfully",
+            "deleted_objects": len(objects_to_delete),
+            "index_rebuilt": True
+        }
+        
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        if error_code == 'NoSuchKey':
+            raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
         else:
-            answer = generate_answer(query, [(r["content"], r["score"]) for r in retrieved])
-            print("Answer:", answer)
-            print("Source Document IDs:", list({r["doc_id"] for r in retrieved}))
+            raise HTTPException(status_code=500, detail=f"AWS S3 error: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {str(e)}")
+
+@app.get("/list_documents")
+def list_documents(org: str, dept: str, base_output_dir: str = "document-upload2/test-output"):
+    """List all documents for a specific organization and department"""
+    try:
+        prefix = f"{base_output_dir}/{org}/{dept}/"
+        response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, Delimiter='/')
+        
+        documents = []
+        if 'CommonPrefixes' in response:
+            for prefix_info in response['CommonPrefixes']:
+                doc_path = prefix_info['Prefix']
+                doc_id = doc_path.rstrip('/').split('/')[-1]
+                
+                # Get document details
+                doc_prefix = f"{prefix}{doc_id}/"
+                doc_response = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=doc_prefix)
+                
+                if 'Contents' in doc_response:
+                    text_files = [obj['Key'] for obj in doc_response['Contents'] if obj['Key'].endswith('.txt')]
+                    image_files = [obj['Key'] for obj in doc_response['Contents'] if obj['Key'].lower().endswith(('.png', '.jpg', '.jpeg'))]
+                    
+                    documents.append({
+                        "doc_id": doc_id,
+                        "text_chunks": len(text_files),
+                        "images": len(image_files),
+                        "upload_date": doc_response['Contents'][0]['LastModified'].isoformat() if doc_response['Contents'] else None
+                    })
+        
+        return {
+            "documents": documents,
+            "total_documents": len(documents)
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list documents: {str(e)}")
+
+# Add root endpoint for health checks
+@app.get("/")
+def root():
+    return {"message": "RAG API is running", "status": "healthy"}
+
+# Add health check endpoint
+@app.get("/health")
+def health_check():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
