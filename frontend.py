@@ -7,9 +7,13 @@ import hashlib
 import role_modfication as rm
 import re
 import os
+from dotenv import load_dotenv
+import base64
 
-# === Load API and other config from .streamlit/secrets.toml or hardcode for dev ===
-API_URL = st.secrets["api"]["url"] if "api" in st.secrets and "url" in st.secrets["api"] else "http://localhost:8000"
+load_dotenv()
+
+# Update this URL to your Railway deployment URL
+API_URL = os.getenv("API_URL", "https://your-app-name.railway.app")
 
 st.set_page_config(page_icon="💬", layout="wide",
                    page_title="Multi-Org Groq Testing")
@@ -89,10 +93,10 @@ def generate_user_session_id():
     return hashlib.md5(timestamp.encode()).hexdigest()[:8]
 
 def create_s3_folder_structure(organization, department):
-    """Create S3 folder path: organizations/{org}/{dept}/uploads/"""
+    """Create S3 folder path: document-upload2/test-output/{org}/{dept}/"""
     org_safe = sanitize_folder_name(organization)
     dept_safe = sanitize_folder_name(department)
-    return f"organizations/{org_safe}/{dept_safe}/uploads"
+    return f"document-upload2/test-output/{org_safe}/{dept_safe}"
 
 def validate_upload_permissions(role):
     """Check if user role has upload permissions"""
@@ -171,6 +175,16 @@ with tab1:
 
     if profile_complete:
         st.sidebar.success("✅ Profile Complete")
+        try:
+            response = requests.post(API_URL, json=st.session_state.user_profile)
+            if response.status_code == 200:
+                result = response.json()
+                st.success(result["message"])
+                st.info(f'Documents Loaded: {result["documents_loaded"]}')
+            else:
+                st.error(f"Failed: {response.text}")
+        except Exception as e:
+            st.error(f"Error connecting to API: {e}")
     else:
         st.sidebar.warning("⚠️ Complete all fields to proceed")
 
@@ -224,10 +238,6 @@ with tab1:
 
     # Handle file upload via API
     if uploaded_file and st.session_state.user_authenticated:
-        st.session_state.messages.append({
-            "role": "user", 
-            "content": f"📎 Uploaded file: {uploaded_file.name} ({organization}/{department})"
-        })
         try:
             # Save file temporarily
             with open(uploaded_file.name, "wb") as f:
@@ -235,7 +245,7 @@ with tab1:
             # Prepare payload
             payload = {
                 "file_path": uploaded_file.name,
-                "base_output_dir": "test-output",
+                "base_output_dir": "document-upload2/test-output",
                 "org": organization,
                 "dept": department,
                 "debug_mode": True
@@ -245,6 +255,10 @@ with tab1:
             if response.status_code == 200:
                 st.success(f"✅ File uploaded and processed successfully!")
                 st.json(response.json())
+                # Clear deleted documents cache and refresh list after successful upload
+                if "deleted_documents" in st.session_state:
+                    st.session_state.deleted_documents = set()
+                st.rerun()
             else:
                 st.error(f"❌ Upload failed: {response.text}")
         except Exception as e:
@@ -252,6 +266,97 @@ with tab1:
         finally:
             if os.path.exists(uploaded_file.name):
                 os.remove(uploaded_file.name)
+
+    # --- Document Management Section ---
+    st.subheader("🗂️ Document Management")
+    
+    if not st.session_state.user_authenticated:
+        st.warning("🔒 Please complete your profile and authenticate to manage documents.")
+    elif not validate_upload_permissions(st.session_state.user_profile.get("role", "")):
+        st.error("❌ You don't have permission to manage documents.")
+    else:
+        # Initialize deleted documents tracking in session state
+        if "deleted_documents" not in st.session_state:
+            st.session_state.deleted_documents = set()
+        
+        # Clear deleted documents if organization or department changes
+        if "current_org_dept" not in st.session_state:
+            st.session_state.current_org_dept = f"{organization}_{department}"
+        elif st.session_state.current_org_dept != f"{organization}_{department}":
+            st.session_state.deleted_documents = set()
+            st.session_state.current_org_dept = f"{organization}_{department}"
+        
+        # List documents
+        try:
+            params = {
+                "org": organization,
+                "dept": department,
+                "base_output_dir": "document-upload2/test-output"
+            }
+            response = requests.get(f"{API_URL}/list_documents", params=params)
+            
+            if response.status_code == 200:
+                data = response.json()
+                documents = data.get("documents", [])
+                
+                # Filter out deleted documents
+                active_documents = [doc for doc in documents if doc['doc_id'] not in st.session_state.deleted_documents]
+                
+                if active_documents:
+                    st.write(f"**Found {len(active_documents)} document(s):**")
+                    
+                    # Create a container for documents
+                    doc_container = st.container()
+                    
+                    for doc in active_documents:
+                        # Check if this document was just deleted
+                        if doc['doc_id'] in st.session_state.deleted_documents:
+                            continue  # Skip this document if it was deleted
+                            
+                        with doc_container.expander(f"📄 {doc['doc_id']} ({doc['text_chunks']} text chunks, {doc['images']} images)"):
+                            col1, col2 = st.columns([3, 1])
+                            
+                            with col1:
+                                st.write(f"**Document ID:** {doc['doc_id']}")
+                                st.write(f"**Text Chunks:** {doc['text_chunks']}")
+                                st.write(f"**Images:** {doc['images']}")
+                                if doc['upload_date']:
+                                    st.write(f"**Upload Date:** {doc['upload_date']}")
+                            
+                            with col2:
+                                # Use a unique key for each delete button
+                                delete_key = f"delete_btn_{doc['doc_id']}"
+                                if st.button(f"🗑️ Delete", key=delete_key):
+                                    # Perform the actual deletion
+                                    try:
+                                        delete_response = requests.delete(
+                                            f"{API_URL}/delete_document",
+                                            params={
+                                                "org": organization,
+                                                "dept": department,
+                                                "doc_id": doc['doc_id'],
+                                                "base_output_dir": "document-upload2/test-output"
+                                            }
+                                        )
+                                        
+                                        if delete_response.status_code == 200:
+                                            # Add to deleted documents set
+                                            st.session_state.deleted_documents.add(doc['doc_id'])
+                                            st.success(f"✅ Document {doc['doc_id']} deleted successfully!")
+                                            # Force rerun to update the list immediately
+                                            st.rerun()
+                                        else:
+                                            st.error(f"❌ Failed to delete document: {delete_response.text}")
+                                    except Exception as e:
+                                        st.error(f"❌ Error deleting document: {e}")
+                else:
+                    st.info("📭 No documents found for this organization and department.")
+                    
+            else:
+                st.error(f"❌ Failed to fetch documents: {response.text}")
+                
+        except Exception as e:
+            st.error(f"❌ Error managing documents: {e}")
 
     # --- Chat Interface (calls FastAPI backend) ---
     st.subheader("💬 Chat Interface")
@@ -270,41 +375,56 @@ with tab1:
                 st.markdown(prompt)
             # Call backend for answer
             try:
-                response = requests.post(f"{API_URL}/Answer", json={"query": prompt})
+                response = requests.post(f"{API_URL}/Answer", json={
+                    "query": prompt,
+                    "org": st.session_state.user_profile["organization"],
+                    "dept": st.session_state.user_profile["department"]
+                })
                 if response.status_code == 200:
                     data = response.json()
                     answer = data.get("result", "No answer returned.")
                     st.session_state.messages.append({"role": "assistant", "content": answer})
                     with st.chat_message("assistant", avatar="🤖"):
                         st.markdown(answer)
-                    # Show source documents if available
-                    if "source_documents" in data:
-                        st.info(f"Source Documents: {data['source_documents']}")
-                else:
-                    st.error(f"❌ Error: {response.text}")
-            except Exception as e:
-                st.error(f"❌ Error: {e}")
 
-    # --- Document Retrieval Section ---
-    st.subheader("📚 Retrieve Source Document")
-    if st.session_state.user_authenticated:
-        doc_id = st.text_input("Enter Document ID to retrieve:")
-        if st.button("Get Document") and doc_id:
-            try:
-                params = {
-                    "org": organization,
-                    "dept": department,
-                    "base_output_dir": "test-output"
-                }
-                response = requests.get(f"{API_URL}/get_source_document/{doc_id}", params=params)
-                if response.status_code == 200:
-                    doc_data = response.json()
-                    st.write("**Text Chunks:**")
-                    for chunk in doc_data.get("text_chunks", []):
-                        st.code(chunk["content"])
-                    st.write("**Images:**")
-                    for img in doc_data.get("images", []):
-                        st.image(img["base64"], caption=img["key"], use_column_width=True)
+                    # Display relevant documents
+                    if "source_documents" in data:
+                        st.markdown("## 📂 Source Documents")
+                        for doc_key in data["source_documents"]:
+                            parts = doc_key.split("/")
+                            doc_id = parts[-2] if len(parts) >= 2 else doc_key
+                            try:
+                                doc_response = requests.get(
+                                    f"{API_URL}/get_source_document/{doc_id}",
+                                    params={
+                                        "org": st.session_state.user_profile["organization"],
+                                        "dept": st.session_state.user_profile["department"]
+                                    }
+                                )
+
+                                if doc_response.status_code == 200:
+                                    doc_data = doc_response.json()
+                                    st.markdown(f"### 📄 Document: `{doc_data['doc_id']}`")
+
+                                    # Text chunks
+                                    if doc_data.get("text_chunks"):
+                                        st.markdown("#### 📝 Text Chunks")
+                                        for txt in doc_data["text_chunks"]:
+                                            st.code(txt["content"])
+
+                                    # Image chunks
+                                    if doc_data.get("images"):
+                                        st.markdown("#### 🖼️ Images")
+                                        for img in doc_data["images"]:
+                                            st.markdown(f"**{img['key']}**")
+                                            try:
+                                                st.image(base64.b64decode(img["base64"]), use_column_width=True)
+                                            except Exception as decode_err:
+                                                st.warning(f"⚠️ Failed to decode image: {decode_err}")
+                                else:
+                                    st.warning(f"⚠️ Could not load content for `{doc_id}`: {doc_response.text}")
+                            except Exception as fetch_err:
+                                st.error(f"❌ Error fetching document `{doc_id}`: {fetch_err}")
                 else:
                     st.error(f"❌ Error: {response.text}")
             except Exception as e:
