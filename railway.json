@@ -1,0 +1,10 @@
+{
+  "build": {
+    "env": {
+      "PYTHONUNBUFFERED": "1"
+    }
+  },
+  "deploy": {
+    "startCommand": "uvicorn main_groq2:app --host 0.0.0.0 --port $PORT"
+  }
+} 
